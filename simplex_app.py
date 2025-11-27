@@ -1,52 +1,21 @@
 import streamlit as st
 import pulp
 
-st.title("Simplex Tableau")
-tipo = st.selectbox("Tipo do problema", ["Maximizar", "Minimizar"])
-n = st.selectbox("Número de variáveis :", [2, 3, 4])
-st.subheader("Função Objetivo")
-obj = [st.number_input(f"Coeficiente de x{i+1}", value=0.0) for i in range(n)]
-m = st.number_input("Quantas restrições?", min_value=1,
-                    max_value=10, value=2, step=1)
-
-A, b, delta, signal = [], [], [], []
-
-st.subheader("Restrições")
-for j in range(m):
-    st.write(f"Restrição {j+1}")
-    A.append(
-        [st.number_input(f"x{i+1} (R{j+1})", value=0.0) for i in range(n)])
-
-    signal.append(
-        st.selectbox(
-            f"Tipo da restrição {j+1}",
-            ["<=", ">=", "="],
-            key=j
-        )
-    )
-
-    b.append(st.number_input(f"LD{j+1}", value=0.0))
-
-    delta.append(
-        st.number_input(
-            f"Variação desejada na restrição {j+1}",
-            value=0.0
-        )
-    )
-
-if st.button("Resolver"):
-    x = [pulp.LpVariable(f"x{i+1}", lowBound=0) for i in range(n)]
+def solve_lp(A, b, obj, signal, tipo, n, m, name="PPL"):
+    """Monta e resolve um PPL com dados fornecidos."""
+    x = [pulp.LpVariable(f"x{i+1}_{name}", lowBound=0) for i in range(n)]
 
     prob = pulp.LpProblem(
-        "PPL",
-        pulp.LpMinimize if tipo == "Minimizar" else pulp.LpMaximize
+        name,
+        pulp.LpMaximize if tipo == "Maximizar" else pulp.LpMinimize
     )
 
+    # Função objetivo
     prob += sum(obj[i] * x[i] for i in range(n))
 
+    # Restrições
     for j in range(m):
         expr = sum(A[j][i] * x[i] for i in range(n))
-
         if signal[j] == "<=":
             prob += expr <= b[j]
         elif signal[j] == ">=":
@@ -55,121 +24,162 @@ if st.button("Resolver"):
             prob += expr == b[j]
 
     prob.solve()
+    return prob, x
 
-    st.subheader("Resultado")
-    st.write({f"x{i+1}": v.value() for i, v in enumerate(x)})
-    st.write("Valor da Função Objetivo:", pulp.value(prob.objective))
 
-    st.subheader("Preços-Sombra (Dual)")
-    try:
-        y = [c.pi for c in prob.constraints.values()]
-        st.write({f"Restrição {j+1}": y[j] for j in range(m)})
-    except:
-        st.write(
-            "Dual não disponível (provavelmente devido a '≥' ou '=' em algumas restrições)."
+def intervalo_preco_sombra(idx, A, b, obj, signal, tipo,
+                           passo=1.0, max_passos=20, tol=1e-4):
+    """
+    Estima, numericamente, o intervalo em que o preço-sombra da
+    restrição idx permanece aproximadamente constante.
+    Retorna (b_down, b_up, y0).
+    """
+    n, m = len(obj), len(b)
+
+    # Problema base
+    prob_base, _ = solve_lp(A, b, obj, signal, tipo, n, m, name="base")
+    status_base = pulp.LpStatus[prob_base.status]
+    if status_base != "Optimal":
+        return None, None, None
+
+    y0 = list(prob_base.constraints.values())[idx].pi
+
+    # Variação para cima
+    b_up = b[idx]
+    for _ in range(max_passos):
+        b_test = b.copy()
+        b_test[idx] = b_up + passo
+        prob_up, _ = solve_lp(A, b_test, obj, signal, tipo, n, m, name=f"up_{idx}")
+        if pulp.LpStatus[prob_up.status] != "Optimal":
+            break
+        y_up = list(prob_up.constraints.values())[idx].pi
+        if abs(y_up - y0) > tol:
+            break
+        b_up += passo
+
+    # Variação para baixo
+    b_down = b[idx]
+    for _ in range(max_passos):
+        b_test = b.copy()
+        b_test[idx] = b_down - passo
+        prob_down, _ = solve_lp(A, b_test, obj, signal, tipo, n, m, name=f"down_{idx}")
+        if pulp.LpStatus[prob_down.status] != "Optimal":
+            break
+        y_down = list(prob_down.constraints.values())[idx].pi
+        if abs(y_down - y0) > tol:
+            break
+        b_down -= passo
+
+    return b_down, b_up, y0
+
+
+# Interface
+
+st.title("Simplex Tableau")
+st.write(
+    "Aplicação para resolver PPL com 2, 3 ou 4 variáveis, "
+    "calcular preços-sombra e analisar alterações nos limites das restrições."
+)
+
+with st.sidebar:
+    st.header("Configurações do problema")
+    tipo = st.selectbox("Tipo do problema", ["Maximizar", "Minimizar"])
+    n = st.selectbox("Número de variáveis", [2, 3, 4])
+    m = st.number_input("Quantas restrições?", min_value=1, max_value=10,
+                        value=2, step=1)
+
+st.subheader("Função Objetivo")
+obj = [st.number_input(f"Coeficiente de x{i+1}", value=0.0)
+       for i in range(n)]
+
+st.subheader("Restrições")
+A, b, delta, signal = [], [], [], []
+
+for j in range(m):
+    st.markdown(f"**Restrição {j+1}**")
+    A.append([st.number_input(f"Coeficiente de x{i+1} (R{j+1})", value=0.0,
+                              key=f"a_{j}_{i}")
+              for i in range(n)])
+
+    signal.append(
+        st.selectbox(
+            f"Tipo da restrição {j+1}",
+            ["<=", ">=", "="],
+            key=f"sinal_{j}"
         )
-
-    new_b = [b[j] + delta[j] for j in range(m)]
-
-    prob2 = pulp.LpProblem(
-        "NovoPPL",
-        pulp.LpMinimize if tipo == "Minimizar" else pulp.LpMaximize
     )
 
-    x2 = [pulp.LpVariable(f"x{i+1}", lowBound=0) for i in range(n)]
-    prob2 += sum(obj[i] * x2[i] for i in range(n))
+    b.append(st.number_input(f"LD{j+1}", value=0.0, key=f"b_{j}"))
 
-    for j in range(m):
-        expr = sum(A[j][i] * x2[i] for i in range(n))
+    delta.append(
+        st.number_input(
+            f"Variação desejada em LD{j+1}",
+            value=0.0,
+            key=f"delta_{j}"
+        )
+    )
 
-        if signal[j] == "<=":
-            prob2 += expr <= new_b[j]
-        elif signal[j] == ">=":
-            prob2 += expr >= new_b[j]
-        else:
-            prob2 += expr == new_b[j]
+if st.button("Resolver"):
+    # Problema original 
+    prob, x = solve_lp(A, b, obj, signal, tipo, n, m, name="PPL")
 
-    prob2.solve()
+    status = pulp.LpStatus[prob.status]
+    st.subheader("Resultado")
+    st.write("Status do problema:", status)
+
+    if status != "Optimal":
+        st.error("Problema não possui solução ótima (pode ser inviável ou ilimitado).")
+        st.stop()
+
+    # Solução ótima 
+    solucao = {f"x{i+1}": float(v.value()) for i, v in enumerate(x)}
+    st.write(solucao)
+    st.write("Valor da Função Objetivo:", float(pulp.value(prob.objective)))
+
+    # PS
+    st.subheader("Preços-Sombra (Dual)")
+    constraints = list(prob.constraints.values())
+    precos = {f"Restrição {j+1}": float(constraints[j].pi) for j in range(m)}
+    st.write(precos)
+
+    # Problema com alterações nos LDs 
+    new_b = [b[j] + delta[j] for j in range(m)]
 
     st.subheader("Análise com alterações")
-    if pulp.LpStatus[prob2.status] != "Optimal":
-        st.error("Alterações inviáveis.")
+    st.write("Novos LDs:", new_b)
+
+    prob2, x2 = solve_lp(A, new_b, obj, signal, tipo, n, m, name="NovoPPL")
+    status2 = pulp.LpStatus[prob2.status]
+    st.write("Status após alterações:", status2)
+
+    if status2 != "Optimal":
+        st.error("Alterações inviáveis: o problema modificado não possui solução ótima.")
     else:
         st.success("Alterações viáveis.")
-        st.write("Novo valor da função objetivo:", pulp.value(prob2.objective))
+        nova_solucao = {f"x{i+1}": float(v.value()) for i, v in enumerate(x2)}
+        st.write("Novo ponto ótimo de operação:")
+        st.write(nova_solucao)
+        st.write("Novo valor da função objetivo:",
+                 float(pulp.value(prob2.objective)))
 
-        # Calcular limites de validade dos preços-sombra através de análise de sensibilidade
-        st.write("Limites válidos dos preços-sombra:")
-        shadow_price_limits = {}
+    # Intervalo de validade dos PS
+    st.subheader("Limites aproximados de validade dos preços-sombra")
+    st.write(
+        "Para cada restrição, é estimado um intervalo de valores de LD "
+        "em que o preço-sombra permanece aproximadamente constante."
+    )
 
-        for j in range(m):
-            if y[j] is not None and y[j] != 0:
-                original_b = b[j]
-                # Calcular limites através de busca binária aproximada
-                # Encontrar o maior aumento e diminuição onde o preço-sombra permanece válido
-
-                def test_shadow_price(test_b_value):
-                    """Testa se o preço-sombra permanece o mesmo para um valor de b[j]"""
-                    test_prob = pulp.LpProblem(
-                        "Test", pulp.LpMinimize if tipo == "Minimizar" else pulp.LpMaximize)
-                    test_x = [pulp.LpVariable(
-                        f"x{i+1}", lowBound=0) for i in range(n)]
-                    test_prob += sum(obj[i] * test_x[i] for i in range(n))
-
-                    for k in range(m):
-                        test_expr = sum(A[k][i] * test_x[i] for i in range(n))
-                        if k == j:
-                            if signal[j] == "<=":
-                                test_prob += test_expr <= test_b_value
-                            elif signal[j] == ">=":
-                                test_prob += test_expr >= test_b_value
-                            else:
-                                test_prob += test_expr == test_b_value
-                        else:
-                            if signal[k] == "<=":
-                                test_prob += test_expr <= b[k]
-                            elif signal[k] == ">=":
-                                test_prob += test_expr >= b[k]
-                            else:
-                                test_prob += test_expr == b[k]
-
-                    test_prob.solve()
-                    if pulp.LpStatus[test_prob.status] == "Optimal":
-                        test_y = list(test_prob.constraints.values())[j].pi
-                        return test_y is not None and abs(test_y - y[j]) < 1e-6
-                    return False
-
-                # Buscar limite superior
-                upper_limit = original_b
-                step = max(abs(original_b) * 0.1,
-                           1.0) if original_b != 0 else 1.0
-                for _ in range(20):  # Limitar iterações
-                    if test_shadow_price(upper_limit + step):
-                        upper_limit += step
-                        step *= 1.5
-                    else:
-                        break
-
-                # Buscar limite inferior
-                lower_limit = original_b
-                step = max(abs(original_b) * 0.1,
-                           1.0) if original_b != 0 else 1.0
-                for _ in range(20):  # Limitar iterações
-                    if test_shadow_price(lower_limit - step):
-                        lower_limit -= step
-                        step *= 1.5
-                    else:
-                        break
-
-                shadow_price_limits[f"Restrição {j+1}"] = (
-                    f"Preço-sombra: {y[j]:.4f}, "
-                    f"Válido para b[{j+1}] entre {lower_limit:.4f} e {upper_limit:.4f}"
-                )
-            elif y[j] is not None:
-                shadow_price_limits[
-                    f"Restrição {j+1}"] = f"Preço-sombra: {y[j]:.4f} (restrição não ativa)"
-            else:
-                shadow_price_limits[f"Restrição {j+1}"] = "Preço-sombra não disponível"
-
-        for key, value in shadow_price_limits.items():
-            st.write(f"{key}: {value}")
+    for j in range(m):
+        b_down, b_up, yj = intervalo_preco_sombra(j, A, b, obj, signal, tipo)
+        if b_down is None:
+            st.write(f"Restrição {j+1}: não foi possível estimar o intervalo.")
+        else:
+            st.write(
+                {
+                    f"Restrição {j+1}": {
+                        "preço_sombra": float(yj),
+                        "LD_mínimo": float(b_down),
+                        "LD_máximo": float(b_up),
+                    }
+                }
+            )
